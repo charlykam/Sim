@@ -1,0 +1,442 @@
+"""
+Smart Home Energy Simulation
+A simple yet thorough object-oriented model for energy simulation.
+Enhanced with detailed component reporting, Comfort Metrics, Inspection, Advanced Metrics (SCR/SSR), GasBoiler, and HeatStorage.
+"""
+
+class Component:
+    """Base class for all simulation components."""
+    def __init__(self, name):
+        self.name = name
+        self.history = []
+
+    def reset(self):
+        """Reset internal state for a new simulation run."""
+        self.history = []
+
+    def record(self, value):
+        """Record a value for the current timestep."""
+        self.history.append(value)
+
+
+class Demand(Component):
+    """Represents an energy demand (electricity or heat)."""
+    def __init__(self, name, demand_type, profile):
+        super().__init__(name)
+        self.demand_type = demand_type
+        self.profile = profile
+
+    def get_demand(self, t):
+        val = self.profile[t % len(self.profile)] if isinstance(self.profile, list) else self.profile
+        self.record(val)
+        return val
+
+
+class Generator(Component):
+    """Represents a component that produces energy."""
+    def __init__(self, name, output_type, capacity, efficiency=1.0, 
+                 input_type=None, emissions_factor=0.0, cost_per_input=0.0):
+        super().__init__(name)
+        self.output_type = output_type
+        self.capacity = capacity
+        self.efficiency = efficiency
+        self.input_type = input_type
+        self.emissions_factor = emissions_factor
+        self.cost_per_input = cost_per_input
+
+    def operate(self, required_output, available_input=float('inf')):
+        target_output = min(required_output, self.capacity)
+        required_input = target_output / self.efficiency if self.efficiency > 0 else 0
+        actual_input = min(required_input, available_input)
+        actual_output = actual_input * self.efficiency
+        
+        cost = actual_input * self.cost_per_input
+        emissions = actual_input * self.emissions_factor
+        
+        self.record(actual_output)
+        return actual_output, actual_input, cost, emissions
+
+
+class Storage(Component):
+    """Represents energy storage (e.g., Battery, HeatStorage)."""
+    def __init__(self, name, energy_type, capacity, max_charge, max_discharge, charge_efficiency=0.95, discharge_efficiency=0.95):
+        super().__init__(name)
+        self.energy_type = energy_type
+        self.capacity = capacity
+        self.max_charge_power = max_charge
+        self.max_discharge_power = max_discharge
+        self.charge_efficiency = charge_efficiency
+        self.discharge_efficiency = discharge_efficiency
+        self.soc = 0.0
+
+    def reset(self):
+        super().reset()
+        self.soc = 0.0
+
+    def charge(self, available_power):
+        power_to_charge = min(available_power, self.max_charge_power)
+        space_left = self.capacity - self.soc
+        actual_charge = min(power_to_charge, space_left / self.charge_efficiency)
+        self.soc += actual_charge * self.charge_efficiency
+        return actual_charge
+
+    def discharge(self, required_power):
+        power_to_discharge = min(required_power, self.max_discharge_power)
+        available_energy = self.soc * self.discharge_efficiency
+        actual_discharge = min(power_to_discharge, available_energy)
+        self.soc -= actual_discharge / self.discharge_efficiency
+        return actual_discharge
+
+    def record_state(self):
+        self.record(self.soc)
+
+
+class Grid(Component):
+    """Represents the external utility grid."""
+    def __init__(self, name, import_price, export_price, emissions_factor):
+        super().__init__(name)
+        self.import_price = import_price
+        self.export_price = export_price
+        self.emissions_factor = emissions_factor
+
+    def interact(self, net_electricity):
+        """Calculate grid interaction cost.
+        net_electricity < 0 means we need to import from grid (demand > supply).
+        net_electricity > 0 means we export surplus to grid (supply > demand).
+        Cost = price_grid * energy_imported - export_price * energy_exported
+        """
+        self.record(net_electricity)
+        if net_electricity < 0:
+            imported = abs(net_electricity)
+            cost = imported * self.import_price
+            return cost, imported * self.emissions_factor, imported, 0.0
+        elif net_electricity > 0:
+            exported = net_electricity
+            # Earning from export is negative cost
+            cost = -exported * self.export_price
+            return cost, 0.0, 0.0, exported
+        return 0.0, 0.0, 0.0, 0.0
+
+
+class Simulation:
+    def __init__(self):
+        self.components = {}
+
+    def add_component(self, component):
+        self.components[component.name] = component
+
+    def run(self, steps=24, solar_profile=None, dt=1.0):
+        if solar_profile is None:
+            solar_profile = [1.0] * steps
+
+        for comp in self.components.values():
+            comp.reset()
+
+        summary = {
+            "Total Cost (CHF)": 0.0,
+            "Total Emissions (kg CO2)": 0.0,
+            "PV Generation (kWh)": 0.0,
+            "Heat Demand (kWh)": 0.0,
+            "Heat Supplied (kWh)": 0.0,
+            "Cooling Demand (kWh)": 0.0,
+            "Cooling Supplied (kWh)": 0.0,
+            "Elec Demand (kWh)": 0.0,
+            "Elec Supplied (kWh)": 0.0,
+            "Grid Import (kWh)": 0.0,
+            "Grid Export (kWh)": 0.0
+        }
+        
+        for t in range(steps):
+            step_heat_demand    = sum(d.get_demand(t) for d in self.components.values() if isinstance(d, Demand) and d.demand_type == 'heat')
+            step_cooling_demand = sum(d.get_demand(t) for d in self.components.values() if isinstance(d, Demand) and d.demand_type == 'cooling')
+            base_elec_demand    = sum(d.get_demand(t) for d in self.components.values() if isinstance(d, Demand) and d.demand_type == 'electricity')
+
+            summary["Heat Demand (kWh)"]    += step_heat_demand * dt
+            summary["Cooling Demand (kWh)"] += step_cooling_demand * dt
+            summary["Elec Demand (kWh)"]    += base_elec_demand * dt
+
+            # --- 1. PV Generation ---
+            # solar_profile values are fractions (0.0–1.0) of peak capacity.
+            # pv_gen = capacity × solar_fraction  →  pv_factor scales capacity proportionally.
+            pv = self.components.get('PV')
+            pv_gen = 0.0
+            if pv:
+                solar_fraction = solar_profile[t % len(solar_profile)]  # 0.0–1.0
+                pv_gen, _, cost, em = pv.operate(pv.capacity * solar_fraction)
+                summary["PV Generation (kWh)"] += pv_gen * dt
+                summary["Total Cost (CHF)"]     += cost * dt
+                summary["Total Emissions (kg CO2)"] += em * dt
+
+            # --- 2. Heat System Logic ---
+            # Priority: 1) HeatPump (primary, up to capacity)
+            #           2) GasBoiler (backup, up to capacity, for what HP can't cover)
+            #           3) HeatStorage discharge (last resort, for anything still unmet)
+            # HeatStorage also charges from PV surplus via HeatPump.
+            heat_unmet = step_heat_demand
+            hs = self.components.get('HeatStorage')
+            hp = self.components.get('HeatPump')
+            gb = self.components.get('GasBoiler')
+
+            # a. HeatPump runs first — capped at its capacity
+            hp_heat_for_demand = min(hp.capacity, heat_unmet) if hp else 0.0
+
+            # b. Check if excess PV allows charging HeatStorage via HeatPump
+            hp_heat_for_storage = 0.0
+            if hp and hs:
+                hp_elec_so_far = hp_heat_for_demand / hp.efficiency if hp.efficiency > 0 else 0.0
+                net_e = base_elec_demand + hp_elec_so_far - pv_gen
+                if net_e < 0:  # Excess PV available
+                    excess_pv = abs(net_e)
+                    hp_rem_cap = hp.capacity - hp_heat_for_demand
+                    hs_space = hs.capacity - hs.soc
+                    max_heat_we_can_push = hs_space / hs.charge_efficiency
+                    possible_heat = excess_pv * hp.efficiency
+                    charge_heat = min(hp_rem_cap, max_heat_we_can_push, possible_heat)
+                    if charge_heat > 0:
+                        hp_heat_for_storage = charge_heat
+
+            # Operate HeatPump
+            hp_elec_needed = 0.0
+            if hp:
+                total_hp_req = hp_heat_for_demand + hp_heat_for_storage
+                out, inp, cost, em = hp.operate(total_hp_req)
+                out_for_demand = min(out, hp_heat_for_demand)
+                out_for_storage = out - out_for_demand
+                heat_unmet -= out_for_demand
+                hp_elec_needed = inp
+                summary["Total Cost (CHF)"] += cost * dt
+                summary["Total Emissions (kg CO2)"] += em * dt
+                if hs and out_for_storage > 0:
+                    hs.charge(out_for_storage)
+
+            # c. GasBoiler covers what HeatPump could not — capped at boiler capacity
+            if gb and heat_unmet > 0:
+                out, inp, cost, em = gb.operate(heat_unmet)
+                heat_unmet -= out
+                summary["Total Cost (CHF)"] += cost * dt
+                summary["Total Emissions (kg CO2)"] += em * dt
+
+            # Legacy GasHeater support
+            if not gb:
+                gh = self.components.get('GasHeater')
+                if gh and heat_unmet > 0:
+                    out, inp, cost, em = gh.operate(heat_unmet)
+                    heat_unmet -= out
+                    summary["Total Cost (CHF)"] += cost * dt
+                    summary["Total Emissions (kg CO2)"] += em * dt
+
+            # d. HeatStorage discharges as last resort for anything still unmet
+            if hs and heat_unmet > 0:
+                dis = hs.discharge(heat_unmet)
+                heat_unmet -= dis
+
+            if hs:
+                hs.record_state()
+
+            summary["Heat Supplied (kWh)"] += (step_heat_demand - heat_unmet) * dt
+
+            # --- 3. Cooling System Logic ---
+            # Chiller consumes electricity to provide cooling (COP-based, like HeatPump for heat).
+            chiller = self.components.get('Chiller')
+            chiller_elec_needed = 0.0
+            cooling_unmet = step_cooling_demand
+            if chiller and cooling_unmet > 0:
+                out, inp, cost, em = chiller.operate(cooling_unmet)
+                cooling_unmet -= out
+                chiller_elec_needed = inp
+                summary["Total Cost (CHF)"] += cost * dt
+                summary["Total Emissions (kg CO2)"] += em * dt
+            summary["Cooling Supplied (kWh)"] += (step_cooling_demand - cooling_unmet) * dt
+
+            # --- 4. Electrical System Logic ---
+            # net_elec > 0: more demand than supply (need grid import or battery)
+            # net_elec < 0: more supply than demand (can charge battery or export to grid)
+            total_elec_req = base_elec_demand + hp_elec_needed + chiller_elec_needed
+            summary["Elec Demand (kWh)"] += (hp_elec_needed + chiller_elec_needed) * dt
+
+            # pv_available - total_demand (positive = surplus, negative = deficit)
+            net_elec = total_elec_req - pv_gen
+            deficit_elec = max(0, net_elec)
+
+            battery = self.components.get('Battery')
+            if battery:
+                if net_elec < 0:
+                    # PV surplus: charge battery first
+                    # net_elec becomes less negative (or zero) after charging
+                    charged = battery.charge(abs(net_elec))
+                    net_elec += charged   # surplus is reduced
+                else:
+                    # Deficit: discharge battery to cover as much as possible
+                    dis = battery.discharge(net_elec)
+                    net_elec -= dis
+                    deficit_elec -= dis
+                battery.record_state()
+
+            # After battery, remaining net_elec:
+            #   net_elec > 0  -> deficit -> grid import
+            #   net_elec < 0  -> surplus -> export to grid (pv_feed)
+            # Grid.interact convention: negative=import, positive=export, so pass -net_elec
+            # Cost = import_price * grid_import - export_price * pv_feed
+            grid = self.components.get('Grid')
+            if grid:
+                cost, em, imp, exp = grid.interact(-net_elec)
+                summary["Total Cost (CHF)"] += cost * dt
+                summary["Total Emissions (kg CO2)"] += em * dt
+                summary["Grid Import (kWh)"] += imp * dt
+                summary["Grid Export (kWh)"] += exp * dt
+                if net_elec > 0: deficit_elec = 0
+
+            summary["Elec Supplied (kWh)"] += (total_elec_req - max(0, deficit_elec)) * dt
+
+        # Final Analytics
+        summary["Heat Comfort (%)"]    = (summary["Heat Supplied (kWh)"]    / summary["Heat Demand (kWh)"]    * 100) if summary["Heat Demand (kWh)"]    > 0 else 100.0
+        summary["Cooling Comfort (%)"] = (summary["Cooling Supplied (kWh)"] / summary["Cooling Demand (kWh)"] * 100) if summary["Cooling Demand (kWh)"] > 0 else 100.0
+        summary["Elec Comfort (%)"]    = (summary["Elec Supplied (kWh)"]    / summary["Elec Demand (kWh)"]    * 100) if summary["Elec Demand (kWh)"]    > 0 else 100.0
+
+        summary["Self-Consumption Rate (%)"] = ((summary["PV Generation (kWh)"] - summary["Grid Export (kWh)"]) / summary["PV Generation (kWh)"] * 100) if summary["PV Generation (kWh)"] > 0 else 0.0
+        summary["Self-Sufficiency Rate (%)"] = ((summary["Elec Demand (kWh)"] - summary["Grid Import (kWh)"]) / summary["Elec Demand (kWh)"] * 100) if summary["Elec Demand (kWh)"] > 0 else 100.0
+
+        return summary
+
+    def print_parameters(self):
+        print("\n" + "-"*50)
+        print("CURRENT SYSTEM PARAMETERS")
+        print("-"*50)
+        for name, comp in self.components.items():
+            if isinstance(comp, Generator):
+                print(f"{name:12}: Capacity={comp.capacity:<6} Efficiency={comp.efficiency:<6}")
+            elif isinstance(comp, Storage):
+                print(f"{name:12}: Capacity={comp.capacity:<6} MaxCharge={comp.max_charge_power:<6}")
+            elif isinstance(comp, Grid):
+                print(f"{name:12}: ImportPrice={comp.import_price:<6} ExportPrice={comp.export_price:<6}")
+            elif isinstance(comp, Demand):
+                avg_demand = sum(comp.profile)/len(comp.profile) if isinstance(comp.profile, list) else comp.profile
+                print(f"{name:12}: Avg Demand={avg_demand:<6}")
+        print("-"*50 + "\n")
+
+    def print_results(self):
+        print("\n" + "="*50)
+        print("SIMULATION RESULTS BY COMPONENT")
+        print("="*50)
+        for name, comp in self.components.items():
+            vals = [round(v, 2) for v in comp.history]
+            print(f"{name:12}: {vals}")
+        print("="*50 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Convenience functions used by the notebook
+# ---------------------------------------------------------------------------
+
+try:
+    import pandas as pd
+    import numpy as np
+
+    def calculate_comp(base, scen):
+        """Build a DataFrame comparing base and scenario summary dicts."""
+        res = []
+        for m in base:
+            b, s = base[m], scen[m]
+            dev = ((s - b) / abs(b) * 100) if b != 0 else (0.0 if s == 0 else float('nan'))
+            res.append({"Metric": m, "Base": b, "Scenario": s, "Rel. Dev. (%)": dev})
+        return pd.DataFrame(res)
+
+    def color_dev(v):
+        """Color cell: blue=neutral, green=positive, red=negative deviation."""
+        if pd.isna(v) or v == 0:
+            return "background-color:#3b82f6;color:white"
+        return "background-color:#22c55e;color:white" if v > 0 else "background-color:#ef4444;color:white"
+
+    def show_comparison(base, scen, title="Comparison"):
+        """Print a styled comparison table of two scenario summaries."""
+        print(f"--- {title} ---")
+        df = calculate_comp(base, scen)
+        return df.style.map(color_dev, subset=["Rel. Dev. (%)"]).format(
+            {"Base": "{:.2f}", "Scenario": "{:.2f}", "Rel. Dev. (%)": "{:+.2f}%"})
+
+except ImportError:
+    pass   # pandas/numpy not available outside notebook — functions skipped
+
+# Default daily solar profile (4 timesteps = one representative day)
+SOLAR_PROFILE = [0.0, 0.5, 1.0, 0.2]
+
+
+def setup_base():
+    """Create a fresh base-case simulation with default component values."""
+    sim = Simulation()
+    sim.add_component(Demand("Heat",    "heat",        profile=[2.0, 3.0, 2.5, 4.0]))
+    sim.add_component(Demand("Elec",    "electricity", profile=[1.0, 1.2, 1.5, 0.8]))
+    sim.add_component(Demand("Cooling", "cooling",     profile=[0.0, 0.0, 0.0, 0.0]))
+    sim.add_component(Generator("PV",        "electricity", capacity=5.0))
+    sim.add_component(Generator("HeatPump",  "heat",        capacity=3.0, efficiency=3.5,
+                                input_type="electricity"))
+    sim.add_component(Generator("GasBoiler", "heat",        capacity=5.0, efficiency=0.9,
+                                input_type="gas", cost_per_input=0.15, emissions_factor=0.2))
+    sim.add_component(Generator("Chiller",   "cooling",     capacity=4.0, efficiency=3.0,
+                                input_type="electricity"))
+    sim.add_component(Storage("Battery",     "electricity", capacity=10.0,
+                              max_charge=5.0, max_discharge=5.0))
+    sim.add_component(Storage("HeatStorage", "heat",        capacity=5.0,
+                              max_charge=3.0, max_discharge=3.0,
+                              charge_efficiency=0.98, discharge_efficiency=0.98))
+    sim.add_component(Grid("Grid", import_price=0.30, export_price=0.10,
+                           emissions_factor=0.4))
+    return sim
+
+
+def run_scenario(
+    duration_days           = 1,
+    solar_profile           = None,
+    pv_factor               = 1.0,
+    battery_factor          = 1.0,
+    heat_demand_factor      = 1.0,
+    cooling_demand_factor   = 1.0,
+    elec_demand_factor      = 1.0,
+    hp_capacity_factor      = 1.0,
+    chiller_capacity_factor = 1.0,
+    boiler_capacity_factor  = 1.0,
+    heat_storage_factor     = 1.0,
+    grid_import_price_factor = 1.0,
+    grid_export_price_factor = 1.0,
+):
+    """
+    Run base case and scenario for the given duration and factors.
+    Returns (base_summary, scenario_summary).
+
+    All *_factor parameters are multipliers applied on top of the base values.
+    E.g. heat_demand_factor=2.0 doubles the heat demand (coldspell).
+    """
+    if solar_profile is None:
+        solar_profile = SOLAR_PROFILE
+
+    steps_per_day = len(solar_profile)
+    dt            = 24.0 / steps_per_day          # hours per timestep
+    total_steps   = steps_per_day * duration_days  # total timesteps
+
+    # --- Base case (no factors applied) ---
+    base_sim     = setup_base()
+    base_summary = base_sim.run(steps=total_steps, solar_profile=solar_profile, dt=dt)
+
+    # --- Scenario (factors applied to a fresh simulation) ---
+    sim = setup_base()
+    sim.components["PV"].capacity              *= pv_factor
+    sim.components["Battery"].capacity         *= battery_factor
+    sim.components["HeatPump"].capacity        *= hp_capacity_factor
+    sim.components["Chiller"].capacity         *= chiller_capacity_factor
+    sim.components["GasBoiler"].capacity       *= boiler_capacity_factor
+    sim.components["HeatStorage"].capacity     *= heat_storage_factor
+    sim.components["Heat"].profile    = [v * heat_demand_factor    for v in sim.components["Heat"].profile]
+    sim.components["Cooling"].profile = [v * cooling_demand_factor for v in sim.components["Cooling"].profile]
+    sim.components["Elec"].profile    = [v * elec_demand_factor    for v in sim.components["Elec"].profile]
+    sim.components["Grid"].import_price *= grid_import_price_factor
+    sim.components["Grid"].export_price *= grid_export_price_factor
+
+    sim.print_parameters()
+    scenario_summary = sim.run(steps=total_steps, solar_profile=solar_profile, dt=dt)
+    return base_summary, scenario_summary
+
+
+if __name__ == "__main__":
+    base, scen = run_scenario(duration_days=4, heat_demand_factor=2.0)
+    print("Base:"); [print(f"  {k:28}: {v:8.2f}") for k, v in base.items()]
+    print("Scenario:"); [print(f"  {k:28}: {v:8.2f}") for k, v in scen.items()]
