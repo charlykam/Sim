@@ -1,0 +1,23 @@
+Aktuelle Messwerte, Lufttemperatur, Momentanwert
+************************************************
+https://data.geo.admin.ch/ch.meteoschweiz.messwerte-lufttemperatur-10min/ch.meteoschweiz.messwerte-lufttemperatur-10min_de.csv  (Format csv)
+https://data.geo.admin.ch/ch.meteoschweiz.messwerte-lufttemperatur-10min/ch.meteoschweiz.messwerte-lufttemperatur-10min_de.json (Format GeoJSON)
+
+
+Valeurs actuelles, température de l’air, Valeur instantanée 
+***********************************************************
+https://data.geo.admin.ch/ch.meteoschweiz.messwerte-lufttemperatur-10min/ch.meteoschweiz.messwerte-lufttemperatur-10min_fr.csv  (Format csv)
+https://data.geo.admin.ch/ch.meteoschweiz.messwerte-lufttemperatur-10min/ch.meteoschweiz.messwerte-lufttemperatur-10min_fr.json (Format GeoJSON)
+
+
+Valori attuali, temperatura dell'aria, Valore momentaneo 
+********************************************************
+https://data.geo.admin.ch/ch.meteoschweiz.messwerte-lufttemperatur-10min/ch.meteoschweiz.messwerte-lufttemperatur-10min_it.csv  (Format csv)
+https://data.geo.admin.ch/ch.meteoschweiz.messwerte-lufttemperatur-10min/ch.meteoschweiz.messwerte-lufttemperatur-10min_it.json (Format GeoJSON)
+
+
+Current Measurement Values, air temperature, Instantaneous Value 
+****************************************************************
+https://data.geo.admin.ch/ch.meteoschweiz.messwerte-lufttemperatur-10min/ch.meteoschweiz.messwerte-lufttemperatur-10min_en.csv  (Format csv)
+https://data.geo.admin.ch/ch.meteoschweiz.messwerte-lufttemperatur-10min/ch.meteoschweiz.messwerte-lufttemperatur-10min_en.json (Format GeoJSON)
+
