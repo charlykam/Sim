@@ -67,25 +67,29 @@ class Storage(Component):
         self.max_discharge_power = max_discharge
         self.charge_efficiency = charge_efficiency
         self.discharge_efficiency = discharge_efficiency
-        self.soc = 0.0
+        self.soc = self.capacity * 0.6
 
     def reset(self):
         super().reset()
-        self.soc = 0.0
+        self.soc = self.capacity * 0.6
 
-    def charge(self, available_power):
+    def charge(self, available_power, dt):
         power_to_charge = min(available_power, self.max_charge_power)
-        space_left = self.capacity - self.soc
-        actual_charge = min(power_to_charge, space_left / self.charge_efficiency)
-        self.soc += actual_charge * self.charge_efficiency
-        return actual_charge
+        space_left_energy = self.capacity - self.soc
+        max_power_by_space = space_left_energy / self.charge_efficiency / dt
+        
+        actual_charge_power = min(power_to_charge, max_power_by_space)
+        self.soc += actual_charge_power * dt * self.charge_efficiency
+        return actual_charge_power
 
-    def discharge(self, required_power):
+    def discharge(self, required_power, dt):
         power_to_discharge = min(required_power, self.max_discharge_power)
         available_energy = self.soc * self.discharge_efficiency
-        actual_discharge = min(power_to_discharge, available_energy)
-        self.soc -= actual_discharge / self.discharge_efficiency
-        return actual_discharge
+        max_power_by_energy = available_energy / dt
+        
+        actual_discharge_power = min(power_to_discharge, max_power_by_energy)
+        self.soc -= (actual_discharge_power * dt) / self.discharge_efficiency
+        return actual_discharge_power
 
     def record_state(self):
         self.record(self.soc)
@@ -207,7 +211,7 @@ class Simulation:
                 summary["Total Cost (CHF)"] += cost * dt
                 summary["Total Emissions (kg CO2)"] += em * dt
                 if hs and out_for_storage > 0:
-                    hs.charge(out_for_storage)
+                    hs.charge(out_for_storage, dt)
 
             # c. GasBoiler covers what HeatPump could not — capped at boiler capacity
             if gb and heat_unmet > 0:
@@ -227,7 +231,7 @@ class Simulation:
 
             # d. HeatStorage discharges as last resort for anything still unmet
             if hs and heat_unmet > 0:
-                dis = hs.discharge(heat_unmet)
+                dis = hs.discharge(heat_unmet, dt)
                 heat_unmet -= dis
 
             if hs:
@@ -263,11 +267,11 @@ class Simulation:
                 if net_elec < 0:
                     # PV surplus: charge battery first
                     # net_elec becomes less negative (or zero) after charging
-                    charged = battery.charge(abs(net_elec))
+                    charged = battery.charge(abs(net_elec), dt)
                     net_elec += charged   # surplus is reduced
                 else:
                     # Deficit: discharge battery to cover as much as possible
-                    dis = battery.discharge(net_elec)
+                    dis = battery.discharge(net_elec, dt)
                     net_elec -= dis
                     deficit_elec -= dis
                 battery.record_state()
@@ -357,16 +361,26 @@ try:
 except ImportError:
     pass   # pandas/numpy not available outside notebook — functions skipped
 
-# Default daily solar profile (4 timesteps = one representative day)
-SOLAR_PROFILE = [0.0, 0.5, 1.0, 0.2]
+# Default daily solar profiles (4 timesteps = one representative day)
+SOLAR_PROFILE_WINTER = [0.0, 0.4, 0.8, 0.1]
+SOLAR_PROFILE_SUMMER = [0.0, 0.6, 1.0, 0.3]
+SOLAR_PROFILE = SOLAR_PROFILE_WINTER  # Default fallback
 
 
-def setup_base():
-    """Create a fresh base-case simulation with default component values."""
+def setup_base(season="winter"):
+    """Create a fresh base-case simulation with default component values based on season."""
     sim = Simulation()
-    sim.add_component(Demand("Heat",    "heat",        profile=[2.0, 3.0, 2.5, 4.0]))
+    
+    if season == "summer":
+        heat_profile = [0.2, 0.4, 0.3, 0.5]
+        cooling_profile = [1.0, 2.5, 3.0, 1.5]
+    else: # winter
+        heat_profile = [2.0, 3.0, 2.5, 4.0]
+        cooling_profile = [0.0, 0.0, 0.0, 0.0]
+
+    sim.add_component(Demand("Heat",    "heat",        profile=heat_profile))
     sim.add_component(Demand("Elec",    "electricity", profile=[1.0, 1.2, 1.5, 0.8]))
-    sim.add_component(Demand("Cooling", "cooling",     profile=[0.0, 0.0, 0.0, 0.0]))
+    sim.add_component(Demand("Cooling", "cooling",     profile=cooling_profile))
     sim.add_component(Generator("PV",        "electricity", capacity=5.0))
     sim.add_component(Generator("HeatPump",  "heat",        capacity=3.0, efficiency=3.5,
                                 input_type="electricity"))
@@ -386,6 +400,7 @@ def setup_base():
 
 def run_scenario(
     duration_days           = 1,
+    season                  = "winter",
     solar_profile           = None,
     pv_factor               = 1.0,
     battery_factor          = 1.0,
@@ -407,18 +422,18 @@ def run_scenario(
     E.g. heat_demand_factor=2.0 doubles the heat demand (coldspell).
     """
     if solar_profile is None:
-        solar_profile = SOLAR_PROFILE
+        solar_profile = SOLAR_PROFILE_SUMMER if season == "summer" else SOLAR_PROFILE_WINTER
 
     steps_per_day = len(solar_profile)
     dt            = 24.0 / steps_per_day          # hours per timestep
     total_steps   = steps_per_day * duration_days  # total timesteps
 
     # --- Base case (no factors applied) ---
-    base_sim     = setup_base()
+    base_sim     = setup_base(season=season)
     base_summary = base_sim.run(steps=total_steps, solar_profile=solar_profile, dt=dt)
 
     # --- Scenario (factors applied to a fresh simulation) ---
-    sim = setup_base()
+    sim = setup_base(season=season)
     sim.components["PV"].capacity              *= pv_factor
     sim.components["Battery"].capacity         *= battery_factor
     sim.components["HeatPump"].capacity        *= hp_capacity_factor
