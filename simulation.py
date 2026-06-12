@@ -45,10 +45,20 @@ class Generator(Component):
         self.cost_per_input = cost_per_input
 
     def operate(self, required_output, available_input=float('inf')):
-        target_output = min(required_output, self.capacity)
-        required_input = target_output / self.efficiency if self.efficiency > 0 else 0
-        actual_input = min(required_input, available_input)
-        actual_output = actual_input * self.efficiency
+        if self.name == "HeatPump":
+            # For HeatPump: capacity = max input power (electricity), not output
+            # required_input = electricity needed to deliver required_output heat
+            required_input = required_output / self.efficiency if self.efficiency > 0 else 0
+            # actual_input is limited by HP's max input capacity and available input
+            actual_input = min(required_input, self.capacity/self.efficiency, available_input)
+            # actual_output depends on actual input available and efficiency
+            actual_output = actual_input * self.efficiency
+        
+        else:
+            target_output = min(required_output, self.capacity)
+            required_input = target_output / self.efficiency if self.efficiency > 0 else 0
+            actual_input = min(required_input, available_input)
+            actual_output = actual_input * self.efficiency
         
         cost = actual_input * self.cost_per_input
         emissions = actual_input * self.emissions_factor
@@ -97,11 +107,12 @@ class Storage(Component):
 
 class Grid(Component):
     """Represents the external utility grid."""
-    def __init__(self, name, import_price, export_price, emissions_factor):
+    def __init__(self, name, import_price, export_price, emissions_factor, blackout=False):
         super().__init__(name)
         self.import_price = import_price
         self.export_price = export_price
         self.emissions_factor = emissions_factor
+        self.blackout = blackout
 
     def interact(self, net_electricity):
         """Calculate grid interaction cost.
@@ -111,9 +122,12 @@ class Grid(Component):
         """
         self.record(net_electricity)
         if net_electricity < 0:
+            if self.blackout:
+                return 0.0, 0.0, 0.0, 0.0
             imported = abs(net_electricity)
             cost = imported * self.import_price
             return cost, imported * self.emissions_factor, imported, 0.0
+    
         elif net_electricity > 0:
             exported = net_electricity
             # Earning from export is negative cost
@@ -288,7 +302,7 @@ class Simulation:
                 summary["Total Emissions (kg CO2)"] += em * dt
                 summary["Grid Import (kWh)"] += imp * dt
                 summary["Grid Export (kWh)"] += exp * dt
-                if net_elec > 0: deficit_elec = 0
+                deficit_elec = max(0, deficit_elec - imp)
 
             summary["Elec Supplied (kWh)"] += (total_elec_req - max(0, deficit_elec)) * dt
 
@@ -299,6 +313,10 @@ class Simulation:
 
         summary["Self-Consumption Rate (%)"] = ((summary["PV Generation (kWh)"] - summary["Grid Export (kWh)"]) / summary["PV Generation (kWh)"] * 100) if summary["PV Generation (kWh)"] > 0 else 0.0
         summary["Self-Sufficiency Rate (%)"] = ((summary["Elec Demand (kWh)"] - summary["Grid Import (kWh)"]) / summary["Elec Demand (kWh)"] * 100) if summary["Elec Demand (kWh)"] > 0 else 100.0
+
+        # Emissions per kWh (accounting for mixture of PV and grid)
+        total_external_elec = summary["PV Generation (kWh)"] + summary["Grid Import (kWh)"]
+        summary["Emissions per kWh (kg CO2/kWh)"] = (summary["Total Emissions (kg CO2)"] / total_external_elec) if total_external_elec > 0 else 0.0
 
         return summary
 
@@ -367,7 +385,26 @@ SOLAR_PROFILE_SUMMER = [0.0, 0.6, 1.0, 0.3]
 SOLAR_PROFILE = SOLAR_PROFILE_WINTER  # Default fallback
 
 
-def setup_base(season="winter"):
+def calculate_base_demand(season):
+    """Calculate the total average daily electricity consumption of the house (kWh)."""
+    if season == "summer":
+        heat_profile = [0.2, 0.4, 0.3, 0.5]
+        cooling_profile = [1.0, 2.5, 3.0, 1.5]
+    else: # winter
+        heat_profile = [2.0, 3.0, 2.5, 4.0]
+        cooling_profile = [0.0, 0.0, 0.0, 0.0]
+
+    elec_demand = sum([1.0, 1.2, 1.5, 0.8])
+    hp_elec = sum(heat_profile) / 3.5  # HP efficiency is 3.5
+    chiller_elec = sum(cooling_profile) / 3.0  # Chiller efficiency is 3.0
+    
+    # Each profile value represents average kW over the step. 
+    # Total daily kWh = sum(kW) * dt
+    dt = 24.0 / 4.0  # 4 steps per day
+    return (elec_demand + hp_elec + chiller_elec) * dt
+
+
+def setup_base(season="winter", pv_sizing_factor=None):
     """Create a fresh base-case simulation with default component values based on season."""
     sim = Simulation()
     
@@ -381,7 +418,17 @@ def setup_base(season="winter"):
     sim.add_component(Demand("Heat",    "heat",        profile=heat_profile))
     sim.add_component(Demand("Elec",    "electricity", profile=[1.0, 1.2, 1.5, 0.8]))
     sim.add_component(Demand("Cooling", "cooling",     profile=cooling_profile))
-    sim.add_component(Generator("PV",        "electricity", capacity=5.0))
+
+    if pv_sizing_factor is not None:
+        daily_demand = calculate_base_demand(season)
+        solar_profile = SOLAR_PROFILE_SUMMER if season == "summer" else SOLAR_PROFILE_WINTER
+        dt = 24.0 / len(solar_profile)
+        # We need: pv_capacity * dt * sum(solar_profile) = pv_sizing_factor * daily_demand
+        pv_capacity = (pv_sizing_factor * daily_demand) / (dt * sum(solar_profile))
+    else:
+        pv_capacity = 5.0
+
+    sim.add_component(Generator("PV",        "electricity", capacity=pv_capacity))
     sim.add_component(Generator("HeatPump",  "heat",        capacity=3.0, efficiency=3.5,
                                 input_type="electricity"))
     sim.add_component(Generator("GasBoiler", "heat",        capacity=5.0, efficiency=0.9,
@@ -393,7 +440,7 @@ def setup_base(season="winter"):
     sim.add_component(Storage("HeatStorage", "heat",        capacity=5.0,
                               max_charge=3.0, max_discharge=3.0,
                               charge_efficiency=0.98, discharge_efficiency=0.98))
-    sim.add_component(Grid("Grid", import_price=0.30, export_price=0.10,
+    sim.add_component(Grid("Grid", import_price=0.27, export_price=0.08,
                            emissions_factor=0.4))
     return sim
 
@@ -402,6 +449,7 @@ def run_scenario(
     duration_days           = 1,
     season                  = "winter",
     solar_profile           = None,
+    pv_sizing_factor        = None,
     pv_factor               = 1.0,
     battery_factor          = 1.0,
     heat_demand_factor      = 1.0,
@@ -411,6 +459,7 @@ def run_scenario(
     chiller_capacity_factor = 1.0,
     boiler_capacity_factor  = 1.0,
     heat_storage_factor     = 1.0,
+    black_out_factor        = False,  # If True, Grid import is blocked (infinite price) to simulate blackout
     grid_import_price_factor = 1.0,
     grid_export_price_factor = 1.0,
 ):
@@ -429,14 +478,15 @@ def run_scenario(
     total_steps   = steps_per_day * duration_days  # total timesteps
 
     # --- Base case (no factors applied) ---
-    base_sim     = setup_base(season=season)
+    base_sim     = setup_base(season=season, pv_sizing_factor=pv_sizing_factor)
     base_summary = base_sim.run(steps=total_steps, solar_profile=solar_profile, dt=dt)
 
     # --- Scenario (factors applied to a fresh simulation) ---
-    sim = setup_base(season=season)
+    sim = setup_base(season=season, pv_sizing_factor=pv_sizing_factor)
     sim.components["PV"].capacity              *= pv_factor
     sim.components["Battery"].capacity         *= battery_factor
     sim.components["HeatPump"].capacity        *= hp_capacity_factor
+    sim.components["HeatPump"].efficiency       *= hp_capacity_factor  # Assume efficiency scales with capacity for HP
     sim.components["Chiller"].capacity         *= chiller_capacity_factor
     sim.components["GasBoiler"].capacity       *= boiler_capacity_factor
     sim.components["HeatStorage"].capacity     *= heat_storage_factor
@@ -445,11 +495,96 @@ def run_scenario(
     sim.components["Elec"].profile    = [v * elec_demand_factor    for v in sim.components["Elec"].profile]
     sim.components["Grid"].import_price *= grid_import_price_factor
     sim.components["Grid"].export_price *= grid_export_price_factor
-
+    sim.components["Grid"].blackout = black_out_factor
     sim.print_parameters()
     scenario_summary = sim.run(steps=total_steps, solar_profile=solar_profile, dt=dt)
     return base_summary, scenario_summary
 
+
+def run_pv_sweep_scenario(**kwargs):
+    """
+    Runs `run_scenario` for 4 different PV sizing factors: 1.2, 1.0, 0.8, 0.6.
+    Returns a dictionary mapping the sizing factor to (base_summary, scenario_summary).
+    """
+    results = {}
+    for sizing in [1.2, 1.0, 0.8, 0.6]:
+        print(f"\n{'='*50}\nRUNNING SWEEP: PV Sizing Factor = {sizing}x Base Demand\n{'='*50}")
+        # Overwrite pv_sizing_factor in kwargs
+        sweep_kwargs = kwargs.copy()
+        sweep_kwargs['pv_sizing_factor'] = sizing
+        base, scen = run_scenario(**sweep_kwargs)
+        results[sizing] = (base, scen)
+    return results
+
+
+try:
+    from IPython.display import display, HTML
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    def show_sweep_comparison(sweep_results, title="PV Sweep Comparison"):
+        """
+        Displays 4 side-by-side or consecutive styled comparison tables for the sweep results,
+        and plots a grouped bar chart of the relative deviations for all metrics.
+        """
+        print(f"\n--- {title} ---")
+        all_dfs = []
+        for sizing, (base, scen) in sweep_results.items():
+            print(f"\nPV Sizing: {sizing}x Demand")
+            df = calculate_comp(base, scen)
+            styled_df = df.style.map(color_dev, subset=["Rel. Dev. (%)"]).format(
+                {"Base": "{:.2f}", "Scenario": "{:.2f}", "Rel. Dev. (%)": "{:+.2f}%"}
+            )
+            display(HTML(styled_df.to_html()))
+            
+            # Prepare data for plot
+            df_plot = df.copy()
+            df_plot['PV Sizing'] = f"{sizing}x"
+            all_dfs.append(df_plot)
+            
+        if all_dfs:
+            master_df = pd.concat(all_dfs, ignore_index=True)
+            
+            # 1) Absolute Comparison Table
+            print(f"\n--- Absolute Comparison (Scenario Values) ---")
+            abs_df = master_df.pivot(index='Metric', columns='PV Sizing', values='Scenario').reset_index()
+            # Keep original metric order
+            metrics_order = all_dfs[0]['Metric'].tolist()
+            abs_df['Metric'] = pd.Categorical(abs_df['Metric'], categories=metrics_order, ordered=True)
+            abs_df = abs_df.sort_values('Metric')
+            # Keep original sizing columns order
+            sizing_cols = [f"{s}x" for s in sweep_results.keys()]
+            abs_df = abs_df[['Metric'] + sizing_cols]
+            
+            format_dict = {col: "{:.2f}" for col in sizing_cols}
+            styled_abs_df = abs_df.style.format(format_dict)
+            display(HTML(styled_abs_df.to_html()))
+
+            # 2) Relative Deviations Plot
+            master_df_rel = master_df.dropna(subset=['Rel. Dev. (%)'])
+            plt.figure(figsize=(16, 7))
+            sns.barplot(data=master_df_rel, x='Metric', y='Rel. Dev. (%)', hue='PV Sizing')
+            plt.title(f"{title} - Relative Deviations by PV Size", fontsize=14, pad=15)
+            plt.xticks(rotation=45, ha='right')
+            plt.ylabel("Relative Deviation (%)")
+            plt.yscale('symlog', linthresh=10.0)
+            plt.axhline(0, color='black', linewidth=0.8)
+            plt.tight_layout()
+            plt.show()
+
+            # 3) Absolute Values Plot
+            plt.figure(figsize=(16, 7))
+            sns.barplot(data=master_df, x='Metric', y='Scenario', hue='PV Sizing')
+            plt.title(f"{title} - Absolute Scenario Values by PV Size", fontsize=14, pad=15)
+            plt.xticks(rotation=45, ha='right')
+            plt.ylabel("Absolute Value")
+            plt.axhline(0, color='black', linewidth=0.8)
+            plt.tight_layout()
+            plt.show()
+
+except ImportError:
+    def show_sweep_comparison(sweep_results, title="PV Sweep Comparison"):
+        pass
 
 if __name__ == "__main__":
     base, scen = run_scenario(duration_days=4, heat_demand_factor=2.0)
