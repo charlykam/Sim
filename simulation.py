@@ -150,9 +150,9 @@ class Simulation:
         for comp in self.components.values():
             comp.reset()
 
+        total_emissions = 0.0
         summary = {
             "Total Cost (CHF)": 0.0,
-            "Total Emissions (kg CO2)": 0.0,
             "PV Generation (kWh)": 0.0,
             "Heat Demand (kWh)": 0.0,
             "Heat Supplied (kWh)": 0.0,
@@ -183,7 +183,7 @@ class Simulation:
                 pv_gen, _, cost, em = pv.operate(pv.capacity * solar_fraction)
                 summary["PV Generation (kWh)"] += pv_gen * dt
                 summary["Total Cost (CHF)"]     += cost * dt
-                summary["Total Emissions (kg CO2)"] += em * dt
+                total_emissions += em * dt
 
             # --- 2. Heat System Logic ---
             # Priority: 1) HeatPump (primary, up to capacity)
@@ -223,7 +223,7 @@ class Simulation:
                 heat_unmet -= out_for_demand
                 hp_elec_needed = inp
                 summary["Total Cost (CHF)"] += cost * dt
-                summary["Total Emissions (kg CO2)"] += em * dt
+                total_emissions += em * dt
                 if hs and out_for_storage > 0:
                     hs.charge(out_for_storage, dt)
 
@@ -232,7 +232,7 @@ class Simulation:
                 out, inp, cost, em = gb.operate(heat_unmet)
                 heat_unmet -= out
                 summary["Total Cost (CHF)"] += cost * dt
-                summary["Total Emissions (kg CO2)"] += em * dt
+                total_emissions += em * dt
 
             # Legacy GasHeater support
             if not gb:
@@ -241,7 +241,7 @@ class Simulation:
                     out, inp, cost, em = gh.operate(heat_unmet)
                     heat_unmet -= out
                     summary["Total Cost (CHF)"] += cost * dt
-                    summary["Total Emissions (kg CO2)"] += em * dt
+                    total_emissions += em * dt
 
             # d. HeatStorage discharges as last resort for anything still unmet
             if hs and heat_unmet > 0:
@@ -263,7 +263,7 @@ class Simulation:
                 cooling_unmet -= out
                 chiller_elec_needed = inp
                 summary["Total Cost (CHF)"] += cost * dt
-                summary["Total Emissions (kg CO2)"] += em * dt
+                total_emissions += em * dt
             summary["Cooling Supplied (kWh)"] += (step_cooling_demand - cooling_unmet) * dt
 
             # --- 4. Electrical System Logic ---
@@ -299,7 +299,7 @@ class Simulation:
             if grid:
                 cost, em, imp, exp = grid.interact(-net_elec)
                 summary["Total Cost (CHF)"] += cost * dt
-                summary["Total Emissions (kg CO2)"] += em * dt
+                total_emissions += em * dt
                 summary["Grid Import (kWh)"] += imp * dt
                 summary["Grid Export (kWh)"] += exp * dt
                 deficit_elec = max(0, deficit_elec - imp)
@@ -316,7 +316,7 @@ class Simulation:
 
         # Emissions per kWh (accounting for mixture of PV and grid)
         total_external_elec = summary["PV Generation (kWh)"] + summary["Grid Import (kWh)"]
-        summary["Emissions per kWh (kg CO2/kWh)"] = (summary["Total Emissions (kg CO2)"] / total_external_elec) if total_external_elec > 0 else 0.0
+        summary["Emissions per kWh (kg CO2/kWh)"] = (total_emissions / total_external_elec) if total_external_elec > 0 else 0.0
 
         return summary
 
@@ -359,8 +359,9 @@ try:
         res = []
         for m in base:
             b, s = base[m], scen[m]
-            dev = ((s - b) / abs(b) * 100) if b != 0 else (0.0 if s == 0 else float('nan'))
-            res.append({"Metric": m, "Base": b, "Scenario": s, "Rel. Dev. (%)": dev})
+            diff = s - b
+            dev = ((diff) / abs(b) * 100) if b != 0 else (0.0 if s == 0 else float('nan'))
+            res.append({"Metric": m, "Base": b, "Scenario": s, "Abs. Diff": diff, "Rel. Dev. (%)": dev})
         return pd.DataFrame(res)
 
     def color_dev(v):
@@ -374,7 +375,7 @@ try:
         print(f"--- {title} ---")
         df = calculate_comp(base, scen)
         return df.style.map(color_dev, subset=["Rel. Dev. (%)"]).format(
-            {"Base": "{:.2f}", "Scenario": "{:.2f}", "Rel. Dev. (%)": "{:+.2f}%"})
+            {"Base": "{:.2f}", "Scenario": "{:.2f}", "Abs. Diff": "{:+.2f}", "Rel. Dev. (%)": "{:+.2f}%"})
 
 except ImportError:
     pass   # pandas/numpy not available outside notebook — functions skipped
@@ -441,7 +442,7 @@ def setup_base(season="winter", pv_sizing_factor=None):
                               max_charge=3.0, max_discharge=3.0,
                               charge_efficiency=0.98, discharge_efficiency=0.98))
     sim.add_component(Grid("Grid", import_price=0.27, export_price=0.08,
-                           emissions_factor=0.4))
+                           emissions_factor=0.09))
     return sim
 
 
@@ -533,7 +534,7 @@ try:
             print(f"\nPV Sizing: {sizing}x Demand")
             df = calculate_comp(base, scen)
             styled_df = df.style.map(color_dev, subset=["Rel. Dev. (%)"]).format(
-                {"Base": "{:.2f}", "Scenario": "{:.2f}", "Rel. Dev. (%)": "{:+.2f}%"}
+                {"Base": "{:.2f}", "Scenario": "{:.2f}", "Abs. Diff": "{:+.2f}", "Rel. Dev. (%)": "{:+.2f}%"}
             )
             display(HTML(styled_df.to_html()))
             
