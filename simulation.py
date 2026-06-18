@@ -381,7 +381,7 @@ except ImportError:
     pass   # pandas/numpy not available outside notebook — functions skipped
 
 # Default daily solar profiles (4 timesteps = one representative day)
-SOLAR_PROFILE_WINTER = [0.0, 0.4, 0.8, 0.1]
+SOLAR_PROFILE_WINTER = [0.0, 0.4, 0.8, 0.0]
 SOLAR_PROFILE_SUMMER = [0.0, 0.6, 1.0, 0.3]
 SOLAR_PROFILE = SOLAR_PROFILE_WINTER  # Default fallback
 
@@ -430,11 +430,11 @@ def setup_base(season="winter", pv_sizing_factor=None):
         pv_capacity = 5.0
 
     sim.add_component(Generator("PV",        "electricity", capacity=pv_capacity))
-    sim.add_component(Generator("HeatPump",  "heat",        capacity=3.0, efficiency=3.5,
+    sim.add_component(Generator("HeatPump",  "heat",        capacity=4.0, efficiency=3.5,
                                 input_type="electricity"))
-    sim.add_component(Generator("GasBoiler", "heat",        capacity=5.0, efficiency=0.9,
+    sim.add_component(Generator("GasBoiler", "heat",        capacity=4.0, efficiency=0.9,
                                 input_type="gas", cost_per_input=0.15, emissions_factor=0.2))
-    sim.add_component(Generator("Chiller",   "cooling",     capacity=4.0, efficiency=3.0,
+    sim.add_component(Generator("Chiller",   "cooling",     capacity=3.0, efficiency=3.5,
                                 input_type="electricity"))
     sim.add_component(Storage("Battery",     "electricity", capacity=10.0,
                               max_charge=5.0, max_discharge=5.0))
@@ -573,10 +573,50 @@ try:
             plt.tight_layout()
             plt.show()
 
-            # 3) Absolute Values Plot
+           
+            # 4) Absolute Values Plot - Base Case
             plt.figure(figsize=(16, 7))
-            sns.barplot(data=master_df, x='Metric', y='Scenario', hue='PV Sizing')
-            plt.title(f"{title} - Absolute Scenario Values by PV Size", fontsize=14, pad=15)
+            sns.barplot(data=master_df, x='Metric', y='Base', hue='PV Sizing')
+            plt.title(f"{title} - Absolute Base Case Values by PV Size", fontsize=14, pad=15)
+            plt.xticks(rotation=45, ha='right')
+            plt.ylabel("Absolute Value")
+            plt.axhline(0, color='black', linewidth=0.8)
+            plt.tight_layout()
+            plt.show()
+
+            # 5) Base vs Scenario Comparison
+            # Melt data to prepare for side-by-side comparison
+            comparison_cols = ['Metric', 'PV Sizing']
+            melted_df = master_df[comparison_cols + ['Base', 'Scenario']].melt(
+                id_vars=comparison_cols, 
+                var_name='Case', 
+                value_name='Value'
+            )
+            melted_df['Metric_Case'] = melted_df['Metric'] + '\n(' + melted_df['Case'] + ')'
+            
+            # Display as table
+            print(f"\n--- Base Case vs Scenario Comparison Table ---")
+            comparison_table = melted_df.pivot_table(
+                index='Metric',
+                columns=['PV Sizing', 'Case'],
+                values='Value',
+                aggfunc='first'
+            )
+            # Keep original metric order
+            comparison_table['Metric'] = pd.Categorical(comparison_table.index, categories=metrics_order, ordered=True)
+            comparison_table = comparison_table.sort_index(key=lambda x: pd.Categorical(x, categories=metrics_order, ordered=True))
+            def _safe_fmt(v):
+                try:
+                    return f"{v:.2f}"
+                except Exception:
+                    return v
+
+            styled_comparison = comparison_table.style.format(_safe_fmt)
+            display(HTML(styled_comparison.to_html()))
+            
+            plt.figure(figsize=(18, 8))
+            sns.barplot(data=melted_df, x='Metric', y='Value', hue='Case')
+            plt.title(f"{title} - Base Case vs Scenario Comparison by PV Size", fontsize=14, pad=15)
             plt.xticks(rotation=45, ha='right')
             plt.ylabel("Absolute Value")
             plt.axhline(0, color='black', linewidth=0.8)
