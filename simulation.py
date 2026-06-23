@@ -54,6 +54,15 @@ class Generator(Component):
             # actual_output depends on actual input available and efficiency
             actual_output = actual_input * self.efficiency
         
+        elif self.name == "Chiller":
+            # For Chiller: capacity = max output power (cooling), not input
+            # required_input = electricity needed to deliver required_output cooling
+            required_input = required_output / self.efficiency if self.efficiency > 0 else 0
+            # actual_input is limited by HP's max input capacity and available input
+            actual_input = min(required_input, self.capacity/self.efficiency, available_input)
+            # actual_output depends on actual input available and efficiency
+            actual_output = actual_input * self.efficiency
+        
         else:
             target_output = min(required_output, self.capacity)
             required_input = target_output / self.efficiency if self.efficiency > 0 else 0
@@ -156,10 +165,16 @@ class Simulation:
             "PV Generation (kWh)": 0.0,
             "Heat Demand (kWh)": 0.0,
             "Heat Supplied (kWh)": 0.0,
+            "Heat Unmet (kWh)": 0.0,
             "Cooling Demand (kWh)": 0.0,
             "Cooling Supplied (kWh)": 0.0,
+            "Cooling Unmet (kWh)": 0.0,
             "Elec Demand (kWh)": 0.0,
+            "Elec Demand - Base Load (kWh)": 0.0,
+            "Elec Demand - Heating (kWh)": 0.0,
+            "Elec Demand - Cooling (kWh)": 0.0,
             "Elec Supplied (kWh)": 0.0,
+            "Elec Unmet (kWh)": 0.0,
             "Grid Import (kWh)": 0.0,
             "Grid Export (kWh)": 0.0
         }
@@ -171,7 +186,7 @@ class Simulation:
 
             summary["Heat Demand (kWh)"]    += step_heat_demand * dt
             summary["Cooling Demand (kWh)"] += step_cooling_demand * dt
-            summary["Elec Demand (kWh)"]    += base_elec_demand * dt
+            summary["Elec Demand - Base Load (kWh)"] += base_elec_demand * dt
 
             # --- 1. PV Generation ---
             # solar_profile values are fractions (0.0–1.0) of peak capacity.
@@ -215,6 +230,8 @@ class Simulation:
 
             # Operate HeatPump
             hp_elec_needed = 0.0
+            hp_output_for_demand = 0.0
+            hp_output_for_storage = 0.0
             if hp:
                 total_hp_req = hp_heat_for_demand + hp_heat_for_storage
                 out, inp, cost, em = hp.operate(total_hp_req)
@@ -222,10 +239,10 @@ class Simulation:
                 out_for_storage = out - out_for_demand
                 heat_unmet -= out_for_demand
                 hp_elec_needed = inp
+                hp_output_for_demand = out_for_demand
+                hp_output_for_storage = out_for_storage
                 summary["Total Cost (CHF)"] += cost * dt
                 total_emissions += em * dt
-                if hs and out_for_storage > 0:
-                    hs.charge(out_for_storage, dt)
 
             # c. GasBoiler covers what HeatPump could not — capped at boiler capacity
             if gb and heat_unmet > 0:
@@ -251,26 +268,30 @@ class Simulation:
             if hs:
                 hs.record_state()
 
-            summary["Heat Supplied (kWh)"] += (step_heat_demand - heat_unmet) * dt
+            # Keep heat supply accounting until any later curtailment
+            heat_supplied = step_heat_demand - heat_unmet
 
             # --- 3. Cooling System Logic ---
             # Chiller consumes electricity to provide cooling (COP-based, like HeatPump for heat).
             chiller = self.components.get('Chiller')
             chiller_elec_needed = 0.0
             cooling_unmet = step_cooling_demand
+            cooling_output = 0.0
             if chiller and cooling_unmet > 0:
                 out, inp, cost, em = chiller.operate(cooling_unmet)
                 cooling_unmet -= out
+                cooling_output = out
                 chiller_elec_needed = inp
                 summary["Total Cost (CHF)"] += cost * dt
                 total_emissions += em * dt
-            summary["Cooling Supplied (kWh)"] += (step_cooling_demand - cooling_unmet) * dt
 
             # --- 4. Electrical System Logic ---
             # net_elec > 0: more demand than supply (need grid import or battery)
             # net_elec < 0: more supply than demand (can charge battery or export to grid)
             total_elec_req = base_elec_demand + hp_elec_needed + chiller_elec_needed
-            summary["Elec Demand (kWh)"] += (hp_elec_needed + chiller_elec_needed) * dt
+            summary["Elec Demand (kWh)"] += total_elec_req * dt
+            summary["Elec Demand - Heating (kWh)"] += hp_elec_needed * dt
+            summary["Elec Demand - Cooling (kWh)"] += chiller_elec_needed * dt
 
             # pv_available - total_demand (positive = surplus, negative = deficit)
             net_elec = total_elec_req - pv_gen
@@ -280,7 +301,6 @@ class Simulation:
             if battery:
                 if net_elec < 0:
                     # PV surplus: charge battery first
-                    # net_elec becomes less negative (or zero) after charging
                     charged = battery.charge(abs(net_elec), dt)
                     net_elec += charged   # surplus is reduced
                 else:
@@ -304,7 +324,38 @@ class Simulation:
                 summary["Grid Export (kWh)"] += exp * dt
                 deficit_elec = max(0, deficit_elec - imp)
 
-            summary["Elec Supplied (kWh)"] += (total_elec_req - max(0, deficit_elec)) * dt
+            elec_unmet = max(0, deficit_elec)
+            if elec_unmet > 0:
+                # Curtail cooling first, then heat pump, to reflect blackout constraints.
+                if chiller_elec_needed > 0:
+                    curtail = min(chiller_elec_needed, elec_unmet)
+                    chiller_elec_needed -= curtail
+                    curtailed_cooling = curtail * chiller.efficiency
+                    cooling_unmet += curtailed_cooling
+                    elec_unmet -= curtail
+
+                if elec_unmet > 0 and hp_elec_needed > 0:
+                    curtail = min(hp_elec_needed, elec_unmet)
+                    hp_elec_needed -= curtail
+                    curtailed_heat = curtail * hp.efficiency
+                    if hp_output_for_storage >= curtailed_heat:
+                        hp_output_for_storage -= curtailed_heat
+                    else:
+                        remaining = curtailed_heat - hp_output_for_storage
+                        hp_output_for_storage = 0.0
+                        hp_output_for_demand = max(0.0, hp_output_for_demand - remaining)
+                        heat_unmet += remaining
+                    elec_unmet -= curtail
+
+            # Charge storage only for the heat pump surplus after potential curtailment.
+            if hs and hp_output_for_storage > 0:
+                hs.charge(hp_output_for_storage, dt)
+
+            summary["Elec Unmet (kWh)"] += elec_unmet * dt
+            summary["Cooling Unmet (kWh)"] += cooling_unmet * dt
+            summary["Heat Supplied (kWh)"] += (step_heat_demand - heat_unmet) * dt
+            summary["Cooling Supplied (kWh)"] += (step_cooling_demand - cooling_unmet) * dt
+            summary["Elec Supplied (kWh)"] += (total_elec_req - elec_unmet) * dt
 
         # Final Analytics
         summary["Heat Comfort (%)"]    = (summary["Heat Supplied (kWh)"]    / summary["Heat Demand (kWh)"]    * 100) if summary["Heat Demand (kWh)"]    > 0 else 100.0
@@ -316,7 +367,7 @@ class Simulation:
 
         # Emissions per kWh (accounting for mixture of PV and grid)
         total_external_elec = summary["PV Generation (kWh)"] + summary["Grid Import (kWh)"]
-        summary["Emissions per kWh (kg CO2/kWh)"] = (total_emissions / total_external_elec) if total_external_elec > 0 else 0.0
+        summary["Emissions per kWh (g CO2/kWh)"] = (total_emissions * 1000 / total_external_elec) if total_external_elec > 0 else 0.0
 
         return summary
 
@@ -395,7 +446,7 @@ def calculate_base_demand(season):
         heat_profile = [2.0, 3.0, 2.5, 4.0]
         cooling_profile = [0.0, 0.0, 0.0, 0.0]
 
-    elec_demand = sum([1.0, 1.2, 1.5, 0.8])
+    elec_demand = sum([0.6, 0.5, 0.5, 0.6])
     hp_elec = sum(heat_profile) / 3.5  # HP efficiency is 3.5
     chiller_elec = sum(cooling_profile) / 3.0  # Chiller efficiency is 3.0
     
@@ -434,7 +485,7 @@ def setup_base(season="winter", pv_sizing_factor=None):
                                 input_type="electricity"))
     sim.add_component(Generator("GasBoiler", "heat",        capacity=4.0, efficiency=0.9,
                                 input_type="gas", cost_per_input=0.15, emissions_factor=0.2))
-    sim.add_component(Generator("Chiller",   "cooling",     capacity=3.0, efficiency=3.5,
+    sim.add_component(Generator("Chiller",   "cooling",     capacity=5.0, efficiency=3.5,
                                 input_type="electricity"))
     sim.add_component(Storage("Battery",     "electricity", capacity=10.0,
                               max_charge=5.0, max_discharge=5.0))
@@ -504,11 +555,11 @@ def run_scenario(
 
 def run_pv_sweep_scenario(**kwargs):
     """
-    Runs `run_scenario` for 4 different PV sizing factors: 1.2, 1.0, 0.8, 0.6.
+    Runs `run_scenario` for 4 different PV sizing factors: 0.5, 0.4, 0.3, 0.2.
     Returns a dictionary mapping the sizing factor to (base_summary, scenario_summary).
     """
     results = {}
-    for sizing in [1.2, 1.0, 0.8, 0.6]:
+    for sizing in [0.5, 0.4, 0.3, 0.2]:
         print(f"\n{'='*50}\nRUNNING SWEEP: PV Sizing Factor = {sizing}x Base Demand\n{'='*50}")
         # Overwrite pv_sizing_factor in kwargs
         sweep_kwargs = kwargs.copy()
@@ -568,7 +619,6 @@ try:
             plt.title(f"{title} - Relative Deviations by PV Size", fontsize=14, pad=15)
             plt.xticks(rotation=45, ha='right')
             plt.ylabel("Relative Deviation (%)")
-            plt.yscale('symlog', linthresh=10.0)
             plt.axhline(0, color='black', linewidth=0.8)
             plt.tight_layout()
             plt.show()
